@@ -1,0 +1,9 @@
+servers = ["http://127.0.0.1:8787"]
+duration = 10.0
+warmup = 2.0
+connections = 4
+
+# Explicit proxy, if desired. Direct is the default.
+# proxy = "socks5h://127.0.0.1:1080"
+
+# Pass tokens via PULSE_TOKEN, rather than storing them here.
