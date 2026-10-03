@@ -164,14 +164,18 @@ fn header(frame: &mut Frame, area: Rect, view: &View<'_>) {
         "Demo · simulated network"
     } else if s.server_name.is_empty() {
         view.selected_server
-            .map(|i| view.settings.servers[i].as_str())
+            .and_then(|i| view.settings.servers.get(i))
+            .map(|server| server.name.as_str())
             .unwrap_or("Automatic server selection")
     } else {
         &s.server_name
     };
     let transport = if s.simulated {
         "SIMULATED"
-    } else if s.server_url.starts_with("https://") {
+    } else if s.server_url.starts_with("https://")
+        || (s.server_url.is_empty()
+            && view.settings.provider == crate::provider::Provider::Librespeed)
+    {
         "HTTPS"
     } else {
         "HTTP"
@@ -194,9 +198,13 @@ fn header(frame: &mut Frame, area: Rect, view: &View<'_>) {
     let label = if s.simulated {
         " DEMO · NO NETWORK TRAFFIC ".to_owned()
     } else if s.server_url.is_empty() {
-        " Enter to begin · Local server: pulse-server".into()
+        if view.settings.provider == crate::provider::Provider::Librespeed {
+            " LibreSpeed public servers · Enter to begin · S to choose a server".into()
+        } else {
+            " Pulse server · Enter to begin · Local server: pulse-server".into()
+        }
     } else {
-        format!(" {}", s.server_url)
+        format!(" {} · {}", view.settings.provider.label(), s.server_url)
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -295,7 +303,11 @@ fn metrics(frame: &mut Frame, area: Rect, view: &View<'_>, narrow: bool) {
         if s.warming_up {
             "Warming up"
         } else {
-            "Live · confirmed"
+            if view.settings.provider == crate::provider::Provider::Librespeed {
+                "Live · acked"
+            } else {
+                "Live · confirmed"
+            }
         }
     } else if s.upload_points.is_empty() {
         "Waiting"
@@ -387,7 +399,12 @@ fn plot(
 
 fn graphs(frame: &mut Frame, area: Rect, view: &View<'_>) {
     let s = view.snapshot;
-    let duration = view.settings.duration.as_secs_f64();
+    let duration = view
+        .settings
+        .duration
+        .as_secs_f64()
+        .max(s.download_points.last().map(|p| p.0).unwrap_or(0.0))
+        .max(s.upload_points.last().map(|p| p.0).unwrap_or(0.0));
     let last = s.latency_points.last().map(|p| p.0).unwrap_or(1.0);
     let latency_title = format!(
         " LATENCY · {} · loaded jitter {} ",
@@ -408,7 +425,11 @@ fn graphs(frame: &mut Frame, area: Rect, view: &View<'_>) {
         plot(
             frame,
             rows[1],
-            " UPLOAD · server-confirmed payload ".into(),
+            if view.settings.provider == crate::provider::Provider::Librespeed {
+                " UPLOAD · acknowledged requests ".into()
+            } else {
+                " UPLOAD · server-confirmed payload ".into()
+            },
             &[("Upload", &s.upload_points, VIOLET)],
             "Mbps",
             [0.0, duration],
@@ -494,12 +515,16 @@ fn status(frame: &mut Frame, area: Rect, view: &View<'_>) {
                         .bg(BORDER),
                 )
                 .ratio(ratio)
-                .label(format!(
-                    "{}  {:.1} / {:.1} s",
-                    s.phase.label(),
-                    s.elapsed,
-                    s.duration
-                )),
+                .label(if s.phase == Phase::Selecting {
+                    format!("Checked {:.0} / {:.0} servers", s.elapsed, s.duration)
+                } else {
+                    format!(
+                        "{}  {:.1} / {:.1} s",
+                        s.phase.label(),
+                        s.elapsed,
+                        s.duration
+                    )
+                }),
             rows[0],
         );
     } else {
@@ -594,7 +619,10 @@ fn server_overlay(
     ];
     let start = selected.saturating_sub(rows[0].height.saturating_sub(4) as usize);
     let choices = std::iter::once("Automatic · lowest median RTT".to_owned())
-        .chain(view.settings.servers.iter().cloned())
+        .chain(view.settings.servers.iter().map(|server| match server.id {
+            Some(id) => format!("#{id} · {}", server.name),
+            None => server.name.clone(),
+        }))
         .collect::<Vec<_>>();
     for (i, server) in choices
         .iter()
@@ -698,7 +726,7 @@ fn history_overlay(frame: &mut Frame, view: &View<'_>, selected: usize, records:
 
 fn help_overlay(frame: &mut Frame, view: &View<'_>) {
     let area = modal(frame, "PULSE · HELP", view.ascii);
-    let text = "Enter     Start or repeat a full test\nEsc       Cancel test / close dialog\nS         Choose or add a Pulse server\nH         Browse completed tests\nE         Export current or selected history result\nQ / Ctrl-C Quit and stop transfers\n\nMbps      Megabits per second\nMB/s      Megabytes per second (Mbps / 8)\nMB        Total payload transferred, including warm-up\nLatency   Median idle HTTP(S) request/response RTT\nJitter    Mean absolute change between adjacent RTT probes\nLoaded    Probes collected during each transfer phase\n\nDirect connections are the default. Use --proxy explicitly.\nRemote speed tests require a remote Pulse server.\nResults reflect the chosen server and route.\n\nEsc closes this dialog";
+    let text = "Enter     Start or repeat a full test\nEsc       Cancel test / close dialog\nS         Choose or add a server\nH         Browse completed tests\nE         Export current or selected history result\nQ / Ctrl-C Quit and stop transfers\n\nMbps      Megabits per second\nMB/s      Megabytes per second (Mbps / 8)\nMB        Total payload transferred, including warm-up\nLatency   Median idle HTTP(S) request/response RTT\nJitter    Mean absolute change between adjacent RTT probes\nLoaded    Probes collected during each transfer phase\n\nDirect connections are the default. Use --proxy explicitly.\nLibreSpeed uses public servers; Pulse uses your own server.\nPublic uploads use acknowledged HTTP requests.\nResults reflect the chosen server and route.\n\nEsc closes this dialog";
     frame.render_widget(
         Paragraph::new(text)
             .style(Style::default().fg(TEXT))

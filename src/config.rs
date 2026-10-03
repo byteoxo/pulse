@@ -1,3 +1,4 @@
+use crate::provider::{Endpoint, Provider};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
@@ -9,6 +10,42 @@ pub enum ColorMode {
     Always,
     Never,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_public_and_existing_server_commands_remain_pulse() {
+        let default = Settings::from_args(&Args::parse_from(["pulse"])).unwrap();
+        assert_eq!(default.provider, Provider::Librespeed);
+        assert!(default.servers.is_empty());
+        let legacy = Settings::from_args(&Args::parse_from([
+            "pulse",
+            "--server",
+            "http://localhost:8787",
+        ]))
+        .unwrap();
+        assert_eq!(legacy.provider, Provider::Pulse);
+        assert_eq!(legacy.servers[0].ping_url, "http://localhost:8787/v1/ping");
+        let public = Settings::from_args(&Args::parse_from([
+            "pulse",
+            "--provider",
+            "librespeed",
+            "--server",
+            "https://example.com/backend",
+        ]))
+        .unwrap();
+        assert_eq!(
+            public.servers[0].download_url,
+            "https://example.com/backend/garbage.php"
+        );
+        let local =
+            Settings::from_args(&Args::parse_from(["pulse", "--provider", "pulse"])).unwrap();
+        assert_eq!(local.servers[0].base_url, "http://127.0.0.1:8787");
+    }
+}
+
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Parser)]
@@ -18,9 +55,21 @@ use std::{path::PathBuf, time::Duration};
     about = "Beautiful network measurements in your terminal"
 )]
 pub struct Args {
-    /// Pulse server base URL. Repeat to automatically select the lowest RTT.
+    /// Provider. Default: LibreSpeed; an explicit --server without this flag preserves Pulse compatibility.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
+    /// Server base URL for the chosen provider. Repeat to select the lowest RTT.
     #[arg(short, long)]
     pub server: Vec<String>,
+    /// LibreSpeed directory URL or local JSON file, using standard endpoint mappings.
+    #[arg(long)]
+    pub server_list: Option<String>,
+    /// Select a public LibreSpeed server ID from its directory.
+    #[arg(long, conflicts_with = "server")]
+    pub server_id: Option<u64>,
+    /// Print available servers without running a speed test; --json returns JSON.
+    #[arg(long, conflicts_with = "demo")]
+    pub list_servers: bool,
     /// Measurement seconds per direction, excluding warm-up.
     #[arg(long)]
     pub duration: Option<f64>,
@@ -61,7 +110,10 @@ pub struct Args {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    provider: Option<Provider>,
     servers: Option<Vec<String>>,
+    server_list: Option<String>,
+    server_id: Option<u64>,
     duration: Option<f64>,
     warmup: Option<f64>,
     connections: Option<usize>,
@@ -70,7 +122,11 @@ struct FileConfig {
 
 #[derive(Clone, Debug)]
 pub struct Settings {
-    pub servers: Vec<String>,
+    pub provider: Provider,
+    pub servers: Vec<Endpoint>,
+    pub server_list: Option<String>,
+    pub server_id: Option<u64>,
+    pub server_cache: Option<PathBuf>,
     pub duration: Duration,
     pub warmup: Duration,
     pub connections: usize,
@@ -121,20 +177,48 @@ impl Settings {
         if !(1..=32).contains(&connections) {
             bail!("Connections must be 1–32");
         }
-        let servers = if args.server.is_empty() {
-            file.servers
-                .unwrap_or_else(|| vec!["http://127.0.0.1:8787".into()])
+        let mut servers = if args.server.is_empty() {
+            file.servers.unwrap_or_default()
         } else {
             args.server.clone()
         };
-        if servers.is_empty() || servers.len() > 32 {
-            bail!("Configure between 1 and 32 servers");
+        let server_list = args.server_list.clone().or(file.server_list);
+        let server_id = args.server_id.or(file.server_id);
+        let provider = args.provider.or(file.provider).unwrap_or_else(|| {
+            if !servers.is_empty() && server_list.is_none() && server_id.is_none() {
+                Provider::Pulse
+            } else {
+                Provider::Librespeed
+            }
+        });
+        if servers.len() > 32 {
+            bail!("Configure at most 32 explicit servers");
         }
+        if !servers.is_empty() && (server_list.is_some() || server_id.is_some()) {
+            bail!("Choose explicit servers or a LibreSpeed directory/ID");
+        }
+        if provider == Provider::Pulse {
+            if server_list.is_some() || server_id.is_some() {
+                bail!("Server lists and IDs require the LibreSpeed provider");
+            }
+            if servers.is_empty() {
+                servers.push("http://127.0.0.1:8787".into());
+            }
+        }
+        let server_cache = args
+            .history_dir
+            .as_ref()
+            .map(|p| p.join("librespeed-directory.cache"))
+            .or_else(crate::provider::default_cache);
         Ok(Self {
+            provider,
             servers: servers
                 .iter()
-                .map(|s| normalize_server(s))
+                .map(|s| Endpoint::from_base(provider, s))
                 .collect::<Result<_>>()?,
+            server_list,
+            server_id,
+            server_cache,
             duration: Duration::from_secs_f64(duration),
             warmup: Duration::from_secs_f64(warmup),
             connections,

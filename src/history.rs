@@ -8,7 +8,7 @@ pub fn default_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pulse/history"))
 }
 
-pub fn write_json(path: &Path, record: &ResultRecord) -> Result<()> {
+pub fn write_json(path: &Path, record: &impl serde::Serialize) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

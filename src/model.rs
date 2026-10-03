@@ -77,6 +77,10 @@ impl ProbeStats {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Transfer {
+    #[serde(default)]
+    pub measurement_method: String,
+    #[serde(default)]
+    pub acknowledged_requests: Option<u64>,
     pub average_mbps: f64,
     pub measured_bytes: u64,
     pub total_bytes: u64,
@@ -94,6 +98,12 @@ pub fn mbps(bytes: u64, seconds: f64) -> f64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultRecord {
+    #[serde(default = "crate::provider::Provider::pulse")]
+    pub provider: crate::provider::Provider,
+    #[serde(default)]
+    pub server_id: Option<u64>,
+    #[serde(default)]
+    pub failed_servers: Vec<String>,
     pub schema_version: u32,
     pub id: String,
     pub timestamp_unix_ms: u64,
@@ -181,5 +191,17 @@ mod tests {
         assert_eq!(stats.failed, 1);
         assert_eq!(ProbeStats::from_samples(&[None, None]).median_ms, None);
         assert_eq!(ProbeStats::from_samples(&[Some(3.0)]).jitter_ms, None);
+    }
+
+    #[test]
+    fn previous_history_records_keep_their_pulse_provider() {
+        let probes = serde_json::json!({"median_ms":10.0,"p95_ms":12.0,"jitter_ms":2.0,"successful":20,"failed":0});
+        let transfer = serde_json::json!({"average_mbps":100.0,"measured_bytes":125000000,"total_bytes":150000000,"measured_seconds":10.0,"loaded_latency":probes.clone()});
+        let legacy = serde_json::json!({"schema_version":1,"id":"legacy","timestamp_unix_ms":1,"server_name":"Local Pulse","server_url":"http://localhost:8787","transport":"HTTP / HTTP/1.1","route":"Direct","probe_method":"HTTP RTT","simulated":false,"connections":4,"warmup_seconds":2.0,"idle_latency":probes,"download":transfer.clone(),"upload":transfer});
+        let record: ResultRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(record.provider, crate::provider::Provider::Pulse);
+        assert_eq!(record.server_id, None);
+        assert_eq!(record.upload.acknowledged_requests, None);
+        assert_eq!(record.upload.average_mbps, 100.0);
     }
 }

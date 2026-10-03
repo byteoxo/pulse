@@ -11,6 +11,7 @@ use pulse::{
     config::{Args, ColorMode, Settings, normalize_server},
     engine, history,
     model::{Phase, ResultRecord, Snapshot},
+    provider::{self, Catalog, Endpoint, Provider},
     ui::{self, Overlay, View},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -60,6 +61,28 @@ async fn main() -> Result<()> {
         ColorMode::Auto => {}
     }
     let settings = Settings::from_args(&args)?;
+    if args.list_servers {
+        let catalog = provider::discover(&settings).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&catalog.servers)?);
+        } else {
+            for server in catalog.servers {
+                println!(
+                    "{}\t{}\t{}",
+                    server
+                        .id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    server.name,
+                    server.base_url
+                );
+            }
+            if !catalog.notice.is_empty() {
+                eprintln!("{}", catalog.notice);
+            }
+        }
+        return Ok(());
+    }
     let history_dir = args
         .history_dir
         .clone()
@@ -124,12 +147,19 @@ struct App {
     tx: watch::Sender<Snapshot>,
     rx: watch::Receiver<Snapshot>,
     job: Option<JoinHandle<Result<ResultRecord>>>,
+    catalog_job: Option<JoinHandle<Result<Catalog>>>,
+    pending_start: bool,
     cancel: CancellationToken,
 }
 
 impl App {
     fn start(&mut self) {
         if self.job.is_some() {
+            return;
+        }
+        if self.catalog_job.is_some() {
+            self.pending_start = true;
+            self.notice = "Loading public servers · the test will start when ready".into();
             return;
         }
         self.notice.clear();
@@ -207,17 +237,20 @@ impl App {
                     }
                     KeyCode::Char(c) if !c.is_control() && input.len() < 2048 => input.push(c),
                     KeyCode::Enter => {
-                        if self.settings.servers.len() >= 32 {
-                            *error = "At most 32 servers can be configured".into();
+                        if self.settings.servers.len() >= 256 {
+                            *error = "At most 256 servers can be configured".into();
                         } else {
                             match normalize_server(input) {
                                 Ok(url) => {
                                     if let Some(index) =
-                                        self.settings.servers.iter().position(|s| s == &url)
+                                        self.settings.servers.iter().position(|s| s.base_url == url)
                                     {
                                         *selected = index + 1;
                                     } else {
-                                        self.settings.servers.push(url);
+                                        self.settings.servers.push(
+                                            Endpoint::from_base(self.settings.provider, &url)
+                                                .expect("URL was already validated"),
+                                        );
                                         *selected = self.settings.servers.len();
                                     }
                                     self.overlay = Overlay::Servers {
@@ -288,6 +321,7 @@ impl App {
         match key.code {
             KeyCode::Enter => self.start(),
             KeyCode::Esc => {
+                self.pending_start = false;
                 if self.job.is_some() {
                     self.cancel.cancel();
                     self.notice = "Stopping transfer tasks…".into();
@@ -295,7 +329,9 @@ impl App {
             }
             KeyCode::Char('q') => return true,
             KeyCode::Char('s') => {
-                if self.job.is_some() {
+                if self.catalog_job.is_some() {
+                    self.notice = "Loading public servers…".into();
+                } else if self.job.is_some() {
                     self.notice = "Cancel or finish this test before changing servers".into();
                 } else {
                     self.overlay = Overlay::Servers {
@@ -319,6 +355,34 @@ impl App {
             _ => {}
         }
         false
+    }
+    async fn finish_catalog(&mut self) {
+        if self
+            .catalog_job
+            .as_ref()
+            .is_none_or(|job| !job.is_finished())
+        {
+            return;
+        }
+        let job = self.catalog_job.take().unwrap();
+        match job.await {
+            Ok(Ok(catalog)) => {
+                self.settings.servers = catalog.servers;
+                self.notice = catalog.notice;
+            }
+            Ok(Err(error)) => {
+                self.pending_start = false;
+                self.notice = format!("Public server list: {error:#}");
+            }
+            Err(error) => {
+                self.pending_start = false;
+                self.notice = format!("Server discovery: {error}");
+            }
+        }
+        if self.pending_start {
+            self.pending_start = false;
+            self.start();
+        }
     }
     async fn finish_job(&mut self) {
         if self.job.as_ref().is_none_or(|job| !job.is_finished()) {
@@ -369,6 +433,17 @@ impl App {
 
 async fn dashboard(args: Args, settings: Settings, history_dir: PathBuf) -> Result<()> {
     let (tx, rx) = watch::channel(Snapshot::default());
+    let catalog_job = if settings.provider == Provider::Librespeed
+        && settings.servers.is_empty()
+        && !settings.demo
+    {
+        let config = settings.clone();
+        Some(tokio::spawn(
+            async move { provider::discover(&config).await },
+        ))
+    } else {
+        None
+    };
     let mut app = App {
         snapshot: Snapshot {
             simulated: settings.demo,
@@ -383,6 +458,8 @@ async fn dashboard(args: Args, settings: Settings, history_dir: PathBuf) -> Resu
         tx,
         rx,
         job: None,
+        catalog_job,
+        pending_start: false,
         cancel: CancellationToken::new(),
     };
     let mut terminal = TerminalGuard::enter()?;
@@ -404,6 +481,7 @@ async fn dashboard(args: Args, settings: Settings, history_dir: PathBuf) -> Resu
                 app.snapshot = app.rx.borrow_and_update().clone();
             }
             app.finish_job().await;
+            app.finish_catalog().await;
             terminal
                 .terminal
                 .draw(|frame| {
@@ -425,6 +503,9 @@ async fn dashboard(args: Args, settings: Settings, history_dir: PathBuf) -> Resu
     }
     .await;
     app.cancel.cancel();
+    if let Some(job) = app.catalog_job.take() {
+        job.abort();
+    }
     if let Some(job) = app.job.take() {
         let _ = tokio::time::timeout(Duration::from_secs(3), job).await;
     }

@@ -1,9 +1,7 @@
+use crate::provider::{self, Endpoint, Provider, client, ping};
 use crate::{
     config::Settings,
-    model::{
-        Phase, ProbeStats, ResultRecord, ServerInfo, SessionStats, Snapshot, Transfer, mbps,
-        payload,
-    },
+    model::{Phase, ProbeStats, ResultRecord, SessionStats, Snapshot, Transfer, mbps, payload},
 };
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -22,56 +20,313 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn client(settings: &Settings) -> Result<Client> {
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::ACCEPT_ENCODING,
-        header::HeaderValue::from_static("identity"),
-    );
-    headers.insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-cache"),
-    );
-    if let Some(token) = &settings.token {
-        let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("Invalid bearer token")?;
-        value.set_sensitive(true);
-        headers.insert(header::AUTHORIZATION, value);
-    }
-    let mut builder = Client::builder()
-        .no_proxy()
-        .http1_only()
-        .default_headers(headers)
-        .connect_timeout(Duration::from_secs(3))
-        // An upload request can still be streaming when the phase ends. A short
-        // response-read timeout would incorrectly reject slow connections.
-        .read_timeout(settings.warmup + settings.duration + Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("pulse/", env!("CARGO_PKG_VERSION")));
-    if let Some(proxy) = &settings.proxy {
-        builder = builder.proxy(reqwest::Proxy::all(proxy).context("Invalid proxy URL")?);
-    }
-    Ok(builder.build()?)
-}
-
-async fn ping(client: &Client, url: &str) -> Result<f64> {
-    let started = Instant::now();
-    let body = client
-        .get(format!("{url}/v1/ping"))
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    if body.as_ref() != b"pulse" {
-        bail!("Unexpected ping response; this endpoint is not a Pulse server");
-    }
-    Ok(started.elapsed().as_secs_f64() * 1000.0)
-}
-
 fn emit(tx: &watch::Sender<Snapshot>, state: &Snapshot) {
     tx.send_replace(state.clone());
+}
+
+async fn rank_servers(
+    settings: &Settings,
+    control: &Client,
+    probe: &Client,
+    tx: &watch::Sender<Snapshot>,
+    state: &mut Snapshot,
+) -> Result<Vec<Endpoint>> {
+    state.message = format!("Loading {} servers", settings.provider.label());
+    emit(tx, state);
+    let catalog = provider::discover(settings).await?;
+    let total = catalog.servers.len();
+    let mut ranked = Vec::new();
+    let mut candidates =
+        futures_util::stream::iter(catalog.servers.into_iter().map(|mut endpoint| {
+            let control = control.clone();
+            let probe = probe.clone();
+            async move {
+                let result = tokio::time::timeout(Duration::from_secs(8), async {
+                    provider::identify(&control, &mut endpoint).await?;
+                    ping(&probe, &endpoint).await?; // Warm DNS/TCP/TLS before ranking.
+                    let mut samples = Vec::new();
+                    for _ in 0..3 {
+                        samples.push(ping(&probe, &endpoint).await.ok());
+                    }
+                    let stats = ProbeStats::from_samples(&samples);
+                    if stats.successful < 2 {
+                        bail!("Too few successful latency probes");
+                    }
+                    Ok::<_, anyhow::Error>(stats.median_ms.unwrap())
+                })
+                .await
+                .context("Server probe deadline exceeded")
+                .and_then(|r| r);
+                (endpoint, result)
+            }
+        }))
+        .buffer_unordered(6);
+    let mut checked = 0;
+    while let Some((endpoint, result)) = candidates.next().await {
+        checked += 1;
+        state.duration = total as f64;
+        state.elapsed = checked as f64;
+        state.message = if catalog.notice.is_empty() {
+            format!("Checked {checked}/{total} servers")
+        } else {
+            format!("{} · checked {checked}/{total} servers", catalog.notice)
+        };
+        emit(tx, state);
+        match result {
+            Ok(rtt) => ranked.push((rtt, endpoint)),
+            Err(error) => {
+                tracing::warn!(server = %endpoint.base_url, error = %error, "Skipping unavailable server")
+            }
+        }
+    }
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if ranked.is_empty() {
+        let hint = if settings.provider == Provider::Pulse {
+            "Start pulse-server or pass --server URL."
+        } else {
+            "Try another server directory or an explicit --proxy."
+        };
+        bail!("No reachable {} server. {hint}", settings.provider.label());
+    }
+    Ok(ranked.into_iter().map(|(_, endpoint)| endpoint).collect())
+}
+
+struct UploadCounters {
+    bytes: AtomicU64,
+    requests: AtomicU64,
+    last_ack_ns: AtomicU64,
+    batch_size: AtomicU64,
+}
+
+impl UploadCounters {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            last_ack_ns: AtomicU64::new(0),
+            batch_size: AtomicU64::new(32 * 1024),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn public_upload(
+    settings: &Settings,
+    probe: &Client,
+    endpoint: &Endpoint,
+    tx: &watch::Sender<Snapshot>,
+    state: &mut Snapshot,
+    test_start: Instant,
+) -> Result<Transfer> {
+    state.phase = Phase::Upload;
+    state.loaded = ProbeStats::default();
+    state.warming_up = true;
+    state.duration = settings.warmup.as_secs_f64();
+    state.elapsed = 0.0;
+    state.message = "Warming up acknowledged uploads".into();
+    emit(tx, state);
+    // Keep each worker's HTTP connection pool across the warm-up boundary.
+    // Warm-up requests finish before new measured requests use these clients.
+    let clients = (0..settings.connections)
+        .map(|_| client(settings))
+        .collect::<Result<Vec<_>>>()?;
+    let counters = Arc::new(UploadCounters::new());
+    if !settings.warmup.is_zero() {
+        public_upload_window(
+            &clients,
+            endpoint,
+            tx,
+            state,
+            counters.clone(),
+            settings.warmup,
+            None,
+        )
+        .await?;
+    }
+    let warmup_bytes = counters.bytes.load(Ordering::Relaxed);
+    counters.bytes.store(0, Ordering::Relaxed);
+    counters.requests.store(0, Ordering::Relaxed);
+    counters.last_ack_ns.store(0, Ordering::Relaxed);
+    state.warming_up = false;
+    state.duration = settings.duration.as_secs_f64();
+    state.elapsed = 0.0;
+    state.upload_mbps = 0.0;
+    state.message = "Measuring acknowledged requests · includes HTTP response time".into();
+    emit(tx, state);
+    let (probe_tx, mut probe_rx) = mpsc::channel(16);
+    let mut probes = JoinSet::new();
+    let probe = probe.clone();
+    let endpoint_clone = endpoint.clone();
+    let interval = settings.probe_interval;
+    probes.spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let sample = ping(&probe, &endpoint_clone).await.ok();
+            if probe_tx
+                .send((test_start.elapsed().as_secs_f64(), sample))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let (seconds, mut samples) = public_upload_window(
+        &clients,
+        endpoint,
+        tx,
+        state,
+        counters.clone(),
+        settings.duration,
+        Some(&mut probe_rx),
+    )
+    .await?;
+    probes.abort_all();
+    while probes.join_next().await.is_some() {}
+    while let Ok((time, sample)) = probe_rx.try_recv() {
+        samples.push(sample);
+        state.current_latency = sample;
+        if let Some(rtt) = sample {
+            state.latency_points.push((time, rtt));
+        }
+    }
+    let measured_bytes = counters.bytes.load(Ordering::Relaxed);
+    let result = Transfer {
+        measurement_method: "acknowledged_http_requests".into(),
+        acknowledged_requests: Some(counters.requests.load(Ordering::Relaxed)),
+        average_mbps: mbps(measured_bytes, seconds),
+        measured_bytes,
+        total_bytes: warmup_bytes + measured_bytes,
+        measured_seconds: seconds,
+        loaded_latency: ProbeStats::from_samples(&samples),
+    };
+    state.upload_mbps = result.average_mbps;
+    state.upload_bytes = result.total_bytes;
+    state.loaded = result.loaded_latency.clone();
+    state.elapsed = seconds;
+    emit(tx, state);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn public_upload_window(
+    clients: &[Client],
+    endpoint: &Endpoint,
+    tx: &watch::Sender<Snapshot>,
+    state: &mut Snapshot,
+    counters: Arc<UploadCounters>,
+    duration: Duration,
+    mut probe_rx: Option<&mut mpsc::Receiver<(f64, Option<f64>)>>,
+) -> Result<(f64, Vec<Option<f64>>)> {
+    let started = Instant::now();
+    let deadline = started + duration;
+    let initial_total = state.upload_bytes;
+    let mut workers = JoinSet::new();
+    for client in clients {
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        let counters = counters.clone();
+        workers.spawn(async move {
+            let payload = payload();
+            while Instant::now() < deadline {
+                let size = counters.batch_size.load(Ordering::Relaxed) as usize;
+                let chunk = payload.clone();
+                let produced = Arc::new(AtomicU64::new(0));
+                let produced_clone = produced.clone();
+                let body = futures_util::stream::unfold((0, chunk), move |(sent, chunk)| {
+                    let produced = produced_clone.clone();
+                    async move {
+                        if sent == size {
+                            return None;
+                        }
+                        let len = (size - sent).min(chunk.len());
+                        produced.fetch_add(len as u64, Ordering::Relaxed);
+                        Some((
+                            Ok::<_, std::io::Error>(chunk.slice(..len)),
+                            (sent + len, chunk),
+                        ))
+                    }
+                });
+                let request_start = Instant::now();
+                let response = client
+                    .post(provider::uncached(&endpoint.upload_url)?)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, size)
+                    .body(reqwest::Body::wrap_stream(body))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let response_body = response.bytes().await?;
+                if !response_body.is_empty() || produced.load(Ordering::Relaxed) != size as u64 {
+                    bail!("Upload endpoint did not acknowledge a complete request");
+                }
+                counters.bytes.fetch_add(size as u64, Ordering::Relaxed);
+                counters.requests.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .last_ack_ns
+                    .fetch_max(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let factor =
+                    (0.5 / request_start.elapsed().as_secs_f64().max(0.001)).clamp(0.5, 4.0);
+                let next = ((size as f64 * factor) as u64 / 16384 * 16384)
+                    .clamp(16 * 1024, 4 * 1024 * 1024);
+                counters.batch_size.store(next, Ordering::Relaxed);
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    let mut samples = Vec::new();
+    let mut recent = VecDeque::from([(0_u64, 0.0_f64)]);
+    loop {
+        while let Some(result) = workers.try_join_next() {
+            result.context("Public upload worker stopped")??;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let bytes = counters.bytes.load(Ordering::Relaxed);
+        recent.push_back((bytes, elapsed));
+        while recent.len() > 2 && elapsed - recent[1].1 >= 1.0 {
+            recent.pop_front();
+        }
+        let first = recent.front().unwrap();
+        if let Some(rx) = &mut probe_rx {
+            while let Ok((time, sample)) = rx.try_recv() {
+                samples.push(sample);
+                state.current_latency = sample;
+                if let Some(rtt) = sample {
+                    state.latency_points.push((time, rtt));
+                }
+            }
+            state.loaded = ProbeStats::from_samples(&samples);
+        }
+        state.upload_bytes = initial_total + bytes;
+        state.elapsed = elapsed;
+        if !state.warming_up {
+            state.upload_mbps = mbps(bytes - first.0, elapsed - first.1);
+            state.upload_points.push((elapsed, state.upload_mbps));
+        }
+        if Instant::now() >= deadline && !workers.is_empty() {
+            state.message =
+                "Finishing in-flight upload requests · waiting for acknowledgements".into();
+        }
+        emit(tx, state);
+        if workers.is_empty() {
+            break;
+        }
+        if Instant::now() > deadline + Duration::from_secs(5) {
+            bail!(
+                "Public upload acknowledgements exceeded the 5 s completion allowance; no result saved"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if counters.bytes.load(Ordering::Relaxed) == 0 {
+        bail!("No upload requests were acknowledged");
+    }
+    Ok((
+        counters.last_ack_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        samples,
+    ))
 }
 
 pub async fn run(
@@ -101,57 +356,72 @@ async fn run_inner(settings: Settings, tx: watch::Sender<Snapshot>) -> Result<Re
     }
     let control = client(&settings)?;
     let probe = client(&settings)?;
-    let mut best: Option<(f64, String, String)> = None;
-    let mut failures = Vec::new();
-    for url in &settings.servers {
-        state.server_url = url.clone();
-        state.message = format!("Checking {url}");
+    let ranked = rank_servers(&settings, &control, &probe, &tx, &mut state).await?;
+    let maximum_attempts = if settings.provider == Provider::Librespeed {
+        3
+    } else {
+        1
+    };
+    let mut attempts = 0;
+    let mut failed_servers = Vec::new();
+    let mut last_error = None;
+    for endpoint in ranked {
+        state = Snapshot {
+            phase: Phase::Selecting,
+            route: settings.route(),
+            connections: settings.connections,
+            server_name: endpoint.name.clone(),
+            server_url: endpoint.base_url.clone(),
+            ..Default::default()
+        };
+        state.message = if attempts == 0 {
+            "Checking download and upload endpoints".into()
+        } else {
+            format!("Previous server failed · trying {}", endpoint.name)
+        };
         emit(&tx, &state);
-        let candidate = async {
-            let info = control
-                .get(format!("{url}/v1/info"))
-                .timeout(Duration::from_secs(3))
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<ServerInfo>()
-                .await?;
-            if info.protocol_version != 1 {
-                bail!("Unsupported Pulse protocol {}", info.protocol_version);
-            }
-            let _ = ping(&probe, url).await?; // Exclude DNS/TCP/TLS establishment.
-            let mut samples = Vec::new();
-            for _ in 0..3 {
-                samples.push(ping(&probe, url).await.ok());
-            }
-            let rtt = ProbeStats::from_samples(&samples)
-                .median_ms
-                .context("No successful probes")?;
-            let name: String = info
-                .name
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(80)
-                .collect();
-            Ok::<_, anyhow::Error>((rtt, url.clone(), name))
+        if let Err(error) = provider::preflight(&control, &endpoint).await {
+            tracing::warn!(server = %endpoint.base_url, error = %error, "Skipping failed transfer endpoints");
+            last_error = Some(error);
+            continue;
         }
-        .await;
-        match candidate {
-            Ok(candidate) if best.as_ref().is_none_or(|b| candidate.0 < b.0) => {
-                best = Some(candidate)
+        attempts += 1;
+        match measure(&settings, &control, &probe, &endpoint, &tx, &mut state).await {
+            Ok(mut record) => {
+                record.failed_servers = failed_servers;
+                if !record.failed_servers.is_empty() {
+                    state.message = format!(
+                        "Finished · recovered after {} failed server attempt(s)",
+                        record.failed_servers.len()
+                    );
+                }
+                state.result = Some(record.clone());
+                emit(&tx, &state);
+                return Ok(record);
             }
-            Ok(_) => {}
-            Err(error) => failures.push(format!("{url}: {error}")),
+            Err(error) => {
+                tracing::warn!(server = %endpoint.base_url, error = %error, "Server measurement failed");
+                failed_servers.push(endpoint.name.clone());
+                last_error = Some(error);
+                if attempts >= maximum_attempts {
+                    break;
+                }
+            }
         }
     }
-    let (_, url, name) = best.with_context(|| {
-        format!(
-            "No reachable Pulse server. Start pulse-server or pass --server URL. {}",
-            failures.join("; ")
-        )
-    })?;
-    state.server_url = url.clone();
-    state.server_name = name.clone();
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No usable server"))).context(format!("No successful {} measurement after {attempts} attempt(s). Select another server or try again.", settings.provider.label()))
+}
+
+async fn measure(
+    settings: &Settings,
+    control: &Client,
+    probe: &Client,
+    endpoint: &Endpoint,
+    tx: &watch::Sender<Snapshot>,
+    state: &mut Snapshot,
+) -> Result<ResultRecord> {
+    state.server_url = endpoint.base_url.clone();
+    state.server_name = endpoint.name.clone();
     state.phase = Phase::Latency;
     state.duration = settings.idle_probes as f64 * settings.probe_interval.as_secs_f64();
     state.message = "Measuring idle HTTP round-trip time".into();
@@ -162,7 +432,7 @@ async fn run_inner(settings: Settings, tx: watch::Sender<Snapshot>) -> Result<Re
     let idle_start = Instant::now();
     for _ in 0..settings.idle_probes {
         timer.tick().await;
-        let sample = ping(&probe, &url).await.ok();
+        let sample = ping(probe, endpoint).await.ok();
         idle_samples.push(sample);
         state.current_latency = sample;
         state.idle = ProbeStats::from_samples(&idle_samples);
@@ -172,32 +442,44 @@ async fn run_inner(settings: Settings, tx: watch::Sender<Snapshot>) -> Result<Re
                 .latency_points
                 .push((test_start.elapsed().as_secs_f64(), rtt));
         }
-        emit(&tx, &state);
+        emit(tx, state);
     }
     if state.idle.successful == 0 {
         bail!("All idle latency probes failed");
     }
     let download = transfer(
-        false, &settings, &control, &probe, &url, &tx, &mut state, test_start,
+        false, settings, control, probe, endpoint, tx, state, test_start,
     )
     .await?;
     state.phase = Phase::Cooldown;
     state.elapsed = 0.0;
     state.duration = settings.cooldown.as_secs_f64();
     state.message = "Letting the connection settle".into();
-    emit(&tx, &state);
+    emit(tx, state);
     tokio::time::sleep(settings.cooldown).await;
-    let upload = transfer(
-        true, &settings, &control, &probe, &url, &tx, &mut state, test_start,
-    )
-    .await?;
-    let record = make_record(&settings, name, url, state.idle.clone(), download, upload);
+    let upload = if settings.provider == Provider::Librespeed {
+        public_upload(settings, probe, endpoint, tx, state, test_start).await?
+    } else {
+        transfer(
+            true, settings, control, probe, endpoint, tx, state, test_start,
+        )
+        .await?
+    };
+    let mut record = make_record(
+        settings,
+        endpoint.name.clone(),
+        endpoint.base_url.clone(),
+        state.idle.clone(),
+        download,
+        upload,
+    );
+    record.server_id = endpoint.id;
     state.phase = Phase::Complete;
     state.download_mbps = record.download.average_mbps;
     state.upload_mbps = record.upload.average_mbps;
     state.message = "Finished · average speeds exclude warm-up · totals include warm-up".into();
     state.result = Some(record.clone());
-    emit(&tx, &state);
+    emit(tx, state);
     Ok(record)
 }
 
@@ -258,11 +540,12 @@ async fn transfer(
     settings: &Settings,
     control: &Client,
     probe: &Client,
-    url: &str,
+    endpoint: &Endpoint,
     tx: &watch::Sender<Snapshot>,
     state: &mut Snapshot,
     test_start: Instant,
 ) -> Result<Transfer> {
+    let url = &endpoint.base_url;
     let mut workers = JoinSet::new();
     let bytes = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
@@ -288,8 +571,9 @@ async fn transfer(
         let target = if let Some(lease) = &lease {
             lease.url.replace("/v1/sessions/", "/v1/upload/")
         } else {
-            format!("{url}/v1/download")
+            endpoint.download_url.clone()
         };
+        let worker_endpoint = endpoint.clone();
         workers.spawn(async move {
             let data = payload();
             loop {
@@ -309,14 +593,11 @@ async fn transfer(
                         .bytes()
                         .await?;
                 } else {
-                    let response = client.get(&target).send().await?.error_for_status()?;
-                    if response
-                        .headers()
-                        .get(header::CONTENT_ENCODING)
-                        .is_some_and(|v| v != "identity")
-                    {
-                        bail!("Compressed downloads are not valid measurements");
-                    }
+                    let response = provider::download_request(&client, &worker_endpoint, 16)?
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    provider::validate_download(&response, &worker_endpoint)?;
                     let mut stream = response.bytes_stream();
                     let mut batch = 0;
                     while let Some(chunk) = stream.next().await {
@@ -370,14 +651,14 @@ async fn transfer(
     // Owned JoinSet aborts this probe when the transfer future is dropped.
     let mut probe_tasks = JoinSet::new();
     let probe_client = probe.clone();
-    let probe_url = url.to_owned();
+    let probe_endpoint = endpoint.clone();
     let interval = settings.probe_interval;
     probe_tasks.spawn(async move {
         let mut timer = tokio::time::interval(interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            let sample = ping(&probe_client, &probe_url).await.ok();
+            let sample = ping(&probe_client, &probe_endpoint).await.ok();
             if probe_tx
                 .send((test_start.elapsed().as_secs_f64(), sample))
                 .await
@@ -460,6 +741,13 @@ async fn transfer(
         bytes.load(Ordering::Relaxed)
     };
     let result = Transfer {
+        measurement_method: if upload {
+            "server_received_counter"
+        } else {
+            "client_received_payload"
+        }
+        .into(),
+        acknowledged_requests: None,
         average_mbps: mbps(measured_bytes, seconds),
         measured_bytes,
         total_bytes,
@@ -488,6 +776,9 @@ fn make_record(
     upload: Transfer,
 ) -> ResultRecord {
     ResultRecord {
+        provider: settings.provider,
+        server_id: None,
+        failed_servers: Vec::new(),
         schema_version: 1,
         id: uuid::Uuid::new_v4().to_string(),
         timestamp_unix_ms: SystemTime::now()
@@ -569,6 +860,8 @@ async fn demo(
             emit(&tx, &state);
         }
         results.push(Transfer {
+            measurement_method: "simulated".into(),
+            acknowledged_requests: None,
             average_mbps: mbps(total as u64, previous),
             measured_bytes: total as u64,
             total_bytes: total as u64,

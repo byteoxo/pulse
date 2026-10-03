@@ -1,9 +1,20 @@
-servers = ["http://127.0.0.1:8787"]
+# Public servers are the default; no server setup is required.
+provider = "librespeed"
 duration = 10.0
 warmup = 2.0
 connections = 4
 
-# Explicit proxy, if desired. Direct is the default.
-# proxy = "socks5h://127.0.0.1:1080"
+# Optional selection from the public directory:
+# server_id = 54
+# server_list = "servers.json"
 
-# Pass tokens via PULSE_TOKEN, rather than storing them here.
+# Explicit public backend, using standard garbage.php / empty.php paths:
+# servers = ["https://la.speedtest.clouvider.net/backend"]
+
+# For your own companion server, replace provider and uncomment servers:
+# provider = "pulse"
+# servers = ["http://127.0.0.1:8787"]
+
+# Direct is the default. An explicit proxy is optional.
+# proxy = "socks5h://127.0.0.1:1080"
+# Pass private Pulse tokens via PULSE_TOKEN.
