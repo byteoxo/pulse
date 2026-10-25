@@ -815,7 +815,8 @@ async fn demo(
     state.server_url = "demo://pulse".into();
     state.route = "No network traffic".into();
     state.idle =
-        ProbeStats::from_samples(&[Some(17.4), Some(18.6), Some(19.2), Some(18.1), Some(20.0)]);
+        ProbeStats::from_samples(&[Some(11.6), Some(12.0), Some(12.4), Some(11.8), Some(12.2)]);
+    state.current_latency = state.idle.median_ms;
     state.phase = Phase::Latency;
     state.message = "SIMULATION · these are illustrative metrics".into();
     emit(&tx, &state);
@@ -836,11 +837,20 @@ async fn demo(
         while started.elapsed() < settings.duration {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let t = started.elapsed().as_secs_f64();
-            let base = if upload { 82.4 } else { 245.6 };
-            let speed = base * (1.0 - (-t * 3.0).exp()) * (1.0 + (t * 4.1).sin() * 0.04);
+            let ramp_seconds = if upload { 2.8 } else { 2.2 };
+            let phase = if upload { 1.7 } else { 0.0 };
+            // Build gradually and vary below the ceiling without a clipped plateau.
+            let utilization = 0.91
+                + (t * 1.3 + phase).sin() * 0.055
+                + (t * 3.7).sin() * 0.025
+                + (t * 8.3 + phase).sin() * 0.01;
+            let speed = 10_000.0 * (1.0 - (-t / ramp_seconds).exp()) * utilization;
             total += speed * 1_000_000.0 / 8.0 * (t - previous);
             previous = t;
-            let rtt = 18.6 + 16.0 * (1.0 - (-t * 2.0).exp()) + (t * 6.0).sin().abs() * 9.0;
+            let rtt = 12.0
+                + 0.9 * (1.0 - (-t / ramp_seconds).exp())
+                + (t * 2.3 + phase).sin() * 0.55
+                + (t * 6.1).sin() * 0.2;
             samples.push(Some(rtt));
             state.current_latency = Some(rtt);
             state.loaded = ProbeStats::from_samples(&samples);

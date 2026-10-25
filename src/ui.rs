@@ -748,8 +748,8 @@ mod tests {
         let snapshot = Snapshot {
             phase: Phase::Upload,
             simulated: true,
-            download_mbps: 245.6,
-            upload_mbps: 82.4,
+            download_mbps: 10_000.0,
+            upload_mbps: 10_000.0,
             ..Default::default()
         };
         for (width, height) in [(120, 42), (100, 30), (80, 24), (60, 24), (48, 18), (30, 12)] {

@@ -34,7 +34,7 @@ Try the interface without any server or network traffic:
 ./target/release/pulse --demo
 ```
 
-Demo metrics are explicitly labeled and are never added to measurement history. Demo mode skips warm-up and uses the configured duration for each simulated direction.
+Demo metrics simulate upload and download speeds building gradually and fluctuating below a 10,000 Mbps ceiling, with idle latency around 12 ms. They are explicitly labeled and are never added to measurement history. Demo mode skips warm-up and uses the configured duration for each simulated direction.
 
 ## Choose a public server
 
